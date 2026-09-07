@@ -1,11 +1,74 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabasePublishableKey =
-  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!;
+// =====================================================
+// ENV
+// =====================================================
 
-function getBangladeshDate() {
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabasePublishableKey =
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+const serviceRoleKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// =====================================================
+// CHECK ENV
+// =====================================================
+
+if (!supabaseUrl) {
+  throw new Error("NEXT_PUBLIC_SUPABASE_URL is missing");
+}
+
+if (!supabasePublishableKey) {
+  throw new Error(
+    "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is missing",
+  );
+}
+
+if (!serviceRoleKey) {
+  throw new Error(
+    "SUPABASE_SERVICE_ROLE_KEY is missing",
+  );
+}
+
+// =====================================================
+// ADMIN / SERVICE ROLE CLIENT
+// =====================================================
+
+const adminSupabase = createClient(
+  supabaseUrl,
+  serviceRoleKey,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  },
+);
+
+// =====================================================
+// USER AUTH CLIENT
+// =====================================================
+
+function createAuthClient(token: string) {
+  return createClient(
+    supabaseUrl!,
+    supabasePublishableKey!,
+    {
+      global: {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    },
+  );
+}
+
+// =====================================================
+// BANGLADESH DATE
+// =====================================================
+
+function getBangladeshDate(): string {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Dhaka",
     year: "numeric",
@@ -14,84 +77,189 @@ function getBangladeshDate() {
   }).format(new Date());
 }
 
-export async function GET(request: NextRequest) {
+// =====================================================
+// VERIFY ADMIN
+// =====================================================
+
+async function verifyAdmin(
+  request: NextRequest,
+) {
   try {
-    const authHeader = request.headers.get("authorization");
+    const authHeader =
+      request.headers.get("authorization");
 
     if (!authHeader?.startsWith("Bearer ")) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Unauthorized",
-        },
-        { status: 401 },
+      console.log(
+        "Attendance API: No authorization header",
       );
+
+      return null;
     }
 
-    const accessToken = authHeader.replace("Bearer ", "");
+    const token = authHeader.substring(7);
 
-    const supabase = createClient(supabaseUrl, supabasePublishableKey, {
-      global: {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-      },
-    });
+    if (!token) {
+      return null;
+    }
 
-    // ---------------------------------------------
-    // VERIFY USER
-    // ---------------------------------------------
+    // -------------------------------------------------
+    // VERIFY SUPABASE USER
+    // -------------------------------------------------
+
+    const authSupabase =
+      createAuthClient(token);
 
     const {
       data: { user },
       error: userError,
-    } = await supabase.auth.getUser();
+    } = await authSupabase.auth.getUser();
 
     if (userError || !user) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Invalid session",
-        },
-        { status: 401 },
+      console.error(
+        "Attendance API user verification error:",
+        userError,
       );
+
+      return null;
     }
 
-    // ---------------------------------------------
-    // CHECK ADMIN
-    // ---------------------------------------------
+    console.log(
+      "Authenticated admin candidate:",
+      user.email,
+    );
 
-    const { data: profile, error: profileError } = await supabase
+    // -------------------------------------------------
+    // GET PROFILE USING SERVICE ROLE
+    // -------------------------------------------------
+
+    const {
+      data: profile,
+      error: profileError,
+    } = await adminSupabase
       .from("profiles")
-      .select("id, full_name, role")
+      .select(
+        "id, full_name, role, is_active",
+      )
       .eq("id", user.id)
-      .single();
+      .maybeSingle();
 
-    if (profileError || !profile || profile.role !== "admin") {
+    if (profileError) {
+      console.error(
+        "Attendance API profile error:",
+        profileError,
+      );
+
+      return null;
+    }
+
+    if (!profile) {
+      console.error(
+        "Admin profile not found:",
+        user.id,
+      );
+
+      return null;
+    }
+
+    console.log(
+      "Admin profile:",
+      profile,
+    );
+
+    // -------------------------------------------------
+    // CHECK ROLE
+    // -------------------------------------------------
+
+    if (profile.role !== "admin") {
+      console.error(
+        "User is not admin:",
+        profile.role,
+      );
+
+      return null;
+    }
+
+    // -------------------------------------------------
+    // CHECK ACTIVE
+    // -------------------------------------------------
+
+    if (profile.is_active === false) {
+      console.error(
+        "Admin account is inactive",
+      );
+
+      return null;
+    }
+
+    return user;
+  } catch (error) {
+    console.error(
+      "verifyAdmin attendance error:",
+      error,
+    );
+
+    return null;
+  }
+}
+
+// =====================================================
+// GET ADMIN ATTENDANCE
+// =====================================================
+
+export async function GET(
+  request: NextRequest,
+) {
+  try {
+    console.log(
+      "GET /api/admin/attendance",
+    );
+
+    // =================================================
+    // VERIFY ADMIN
+    // =================================================
+
+    const adminUser =
+      await verifyAdmin(request);
+
+    if (!adminUser) {
       return NextResponse.json(
         {
           success: false,
           message: "Admin access required.",
         },
-        { status: 403 },
+        {
+          status: 403,
+        },
       );
     }
 
-    // ---------------------------------------------
+    // =================================================
     // DATE
-    // ---------------------------------------------
+    // =================================================
 
-    const { searchParams } = new URL(request.url);
+    const { searchParams } =
+      new URL(request.url);
 
-    const requestedDate = searchParams.get("date");
+    const requestedDate =
+      searchParams.get("date");
 
-    const date = requestedDate || getBangladeshDate();
+    const date =
+      requestedDate ||
+      getBangladeshDate();
 
-    // ---------------------------------------------
+    console.log(
+      "Attendance date:",
+      date,
+    );
+
+    // =================================================
     // GET ATTENDANCE
-    // ---------------------------------------------
+    // =================================================
 
-    const { data: attendance, error: attendanceError } = await supabase
+    const {
+      data: attendance,
+      error: attendanceError,
+    } = await adminSupabase
       .from("attendance")
       .select(
         `
@@ -107,80 +275,182 @@ export async function GET(request: NextRequest) {
         check_out_lng
         `,
       )
-      .eq("attendance_date", date)
+      .eq(
+        "attendance_date",
+        date,
+      )
       .order("check_in", {
         ascending: true,
         nullsFirst: false,
       });
 
     if (attendanceError) {
+      console.error(
+        "Attendance fetch error:",
+        attendanceError,
+      );
+
       return NextResponse.json(
         {
           success: false,
-          message: attendanceError.message,
+          message:
+            attendanceError.message,
         },
-        { status: 500 },
-      );
-    }
-
-    // ---------------------------------------------
-    // GET ALL EMPLOYEES
-    // ---------------------------------------------
-
-    const { data: employees, error: employeeError } = await supabase
-      .from("profiles")
-      .select("id, full_name, role")
-      .eq("role", "employee")
-      .order("full_name", {
-        ascending: true,
-      });
-
-    if (employeeError) {
-      return NextResponse.json(
         {
-          success: false,
-          message: employeeError.message,
+          status: 500,
         },
-        { status: 500 },
       );
     }
 
-    // ---------------------------------------------
-    // MERGE EMPLOYEES + ATTENDANCE
-    // ---------------------------------------------
-
-    const attendanceMap = new Map(
-      (attendance ?? []).map((item) => [item.employee_id, item]),
+    console.log(
+      "Attendance rows:",
+      attendance?.length ?? 0,
     );
 
-    const records = (employees ?? []).map((employee) => {
-      const record = attendanceMap.get(employee.id);
+    // =================================================
+    // GET EMPLOYEES
+    // =================================================
 
-      return {
-        employee_id: employee.id,
-        full_name: employee.full_name || "Unnamed Employee",
+    const {
+      data: employees,
+      error: employeeError,
+    } = await adminSupabase
+      .from("profiles")
+      .select(
+        "id, full_name, role, is_active",
+      )
+      .eq(
+        "role",
+        "employee",
+      )
+      .order(
+        "full_name",
+        {
+          ascending: true,
+        },
+      );
 
-        attendance: record ?? null,
-      };
-    });
+    if (employeeError) {
+      console.error(
+        "Employee fetch error:",
+        employeeError,
+      );
 
-    // ---------------------------------------------
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            employeeError.message,
+        },
+        {
+          status: 500,
+        },
+      );
+    }
+
+    console.log(
+      "Employee rows:",
+      employees?.length ?? 0,
+    );
+
+    // =================================================
+    // CREATE ATTENDANCE MAP
+    // =================================================
+
+    const attendanceMap = new Map(
+      (attendance ?? []).map(
+        (item) => [
+          item.employee_id,
+          item,
+        ],
+      ),
+    );
+
+    // =================================================
+    // MERGE EMPLOYEES + ATTENDANCE
+    // =================================================
+
+    const records =
+      (employees ?? []).map(
+        (employee) => {
+          const record =
+            attendanceMap.get(
+              employee.id,
+            ) ?? null;
+
+          return {
+            employee_id:
+              employee.id,
+
+            full_name:
+              employee.full_name ||
+              "Unnamed Employee",
+
+            is_active:
+              employee.is_active ??
+              true,
+
+            attendance:
+              record,
+          };
+        },
+      );
+
+    // =================================================
     // SUMMARY
-    // ---------------------------------------------
+    // =================================================
 
-    const totalEmployees = employees?.length ?? 0;
+    const totalEmployees =
+      employees?.length ?? 0;
 
-    const present = records.filter((item) => item.attendance?.check_in).length;
+    const present =
+      records.filter(
+        (item) =>
+          Boolean(
+            item.attendance?.check_in,
+          ),
+      ).length;
 
-    const checkedOut = records.filter(
-      (item) => item.attendance?.check_out,
-    ).length;
+    const checkedOut =
+      records.filter(
+        (item) =>
+          Boolean(
+            item.attendance?.check_out,
+          ),
+      ).length;
 
-    const currentlyWorking = records.filter(
-      (item) => item.attendance?.check_in && !item.attendance?.check_out,
-    ).length;
+    const currentlyWorking =
+      records.filter(
+        (item) =>
+          Boolean(
+            item.attendance?.check_in,
+          ) &&
+          !item.attendance
+            ?.check_out,
+      ).length;
 
-    const missing = totalEmployees - present;
+    const missing =
+      totalEmployees - present;
+
+    // =================================================
+    // DEBUG
+    // =================================================
+
+    console.log(
+      "Attendance summary:",
+      {
+        date,
+        totalEmployees,
+        present,
+        checkedOut,
+        currentlyWorking,
+        missing,
+      },
+    );
+
+    // =================================================
+    // RESPONSE
+    // =================================================
 
     return NextResponse.json({
       success: true,
@@ -198,14 +468,22 @@ export async function GET(request: NextRequest) {
       records,
     });
   } catch (error) {
-    console.error("Admin Attendance API Error:", error);
+    console.error(
+      "Admin Attendance API ERROR:",
+      error,
+    );
 
     return NextResponse.json(
       {
         success: false,
-        message: "Internal server error.",
+        message:
+          error instanceof Error
+            ? error.message
+            : String(error),
       },
-      { status: 500 },
+      {
+        status: 500,
+      },
     );
   }
 }
